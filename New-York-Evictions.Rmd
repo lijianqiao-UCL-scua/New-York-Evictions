@@ -5,8 +5,215 @@ date: "2021/12/14"
 output: html_document
 ---
 
-```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+## R Markdown
+
+```{r}
+#library a bunch of packages we may (or may not) use - install them first if not installed already. 
+library(tidyverse)
+library(tmap)
+library(geojsonio)
+library(plotly)
+library(rgdal)
+library(broom)
+library(mapview)
+library(crosstalk)
+library(sf)
+library(sp)
+library(spdep)
+library(car)
+library(fs)
+library(janitor)
 ```
 
-## R Markdown
+
+# 1.load the data
+```{r}
+NewYorkEvictions <- read_csv(here::here("data","Evictions.csv"),
+                             na = c("", "NA", "n/a"),
+                             col_names = TRUE)
+```
+
+```{r}
+NewYorkward <- st_read(here::here("data",
+                                  "geo_export_fa9a0e50-df42-4145-8eb8-ab3c9d783141.shp")) %>%
+  st_transform(.,27700)
+  
+```
+
+```{r}
+summary(NewYorkward)
+```
+
+```{r}
+tmap_mode("view")
+tm_shape(NewYorkward) +
+  tm_polygons(col = NA, alpha = 0.5)
+
+```
+```{r}
+Datatypelist <- NewYorkEvictions %>% 
+  summarise_all(class) %>%
+  pivot_longer(everything(), 
+               names_to="All_variables", 
+               values_to="Variable_class")
+
+Datatypelist
+```
+
+```{r}
+NewYorkEvictionsCoords <- NewYorkEvictions %>%
+  na.omit()%>%
+  #删除空值
+  st_as_sf(., coords = c("Longitude", "Latitude"), 
+                   crs = 4326) %>%
+  st_transform(., 27700)
+  
+  
+```
+
+## Now get the location of Eviction in the City
+```{r}
+tmap_mode("plot")
+tm_shape(NewYorkward) +
+  tm_polygons(col = NA, alpha = 0.5) +
+tm_shape(NewYorkEvictionsCoords) +
+  tm_dots(col = "blue")
+
+```
+# 2Data cleaning
+```{r}
+library(tidyverse)
+
+library(sf)
+NewYorkEvictionsCoords <- distinct(NewYorkEvictionsCoords)
+```
+
+```{r}
+Joinfun <- function(data1, data2){
+
+output<- data1%>%
+  st_join(NewYorkward,.)%>%
+  add_count(boro_cd, name="eviction-borough") 
+
+  return(output)
+}
+```
+
+
+```{r}
+NewYorkEvictionsCoords <- Joinfun(NewYorkEvictionsCoords,NewYorkward)
+```
+
+```{r}
+NewYorkEvictionsCoords_groupby <- NewYorkEvictionsCoords %>% 
+  group_by(.,boro_cd) %>%
+  summarise("Point sum" = unique(`eviction-borough`))
+```
+
+```{r}
+tm2 <- tm_shape(NewYorkEvictionsCoords_groupby)+
+  tm_polygons("Point sum",
+              palette="PuBu")+
+  tm_legend(show=FALSE)+
+  tm_layout(frame=FALSE)+
+  tm_credits("(a)",position = c(0,0.85,size=1.5))
+
+legend <- tm_shape(NewYorkEvictionsCoords_groupby) +
+    tm_polygons("Point sum",
+                palette="PuBu") +
+    tm_scale_bar(position=c(0.2,0.04), text.size=0.6)+
+    tm_compass(north=0, position=c(0.65,0.6))+
+    tm_layout(legend.only = TRUE, legend.position=c(0.2,0.25),asp=0.1)+
+    tm_credits("(c) OpenStreetMap contrbutors and Air b n b", position=c(0.0,0.0))
+t=tmap_arrange( tm2, legend, ncol=2)
+t
+```
+
+```{r}
+#extract the borough
+
+Ward311 <- NewYorkward %>%
+  filter(., boro_cd==311)
+
+#Check to see that the correct borough has been pulled out
+tm_shape(Ward311) +
+  tm_polygons(col = NA, alpha = 0.5)
+```
+
+```{r}
+#clip the data to our single borough
+NewYorkEvictionsCoordsSub <- NewYorkEvictionsCoords[Ward311,]
+#check that it's worked
+tmap_mode("plot")
+```
+
+```{r}
+tm_shape(Ward311) +
+  tm_polygons(col = NA, alpha = 0.5) +
+tm_shape(NewYorkEvictionsCoordsSub) +
+  tm_dots(col = "blue")
+```
+
+```{r}
+#now set a window as the borough boundary
+library(spatstat)
+window <- as.owin(Ward311)
+plot(window)
+```
+```{r}
+#create a sp object
+NewYorkEvictionsCoordsSub<- NewYorkEvictionsCoordsSub %>%
+  as(., 'Spatial')
+#create a ppp object
+NewYorkEvictionsCoordsSub.ppp <- ppp(x=NewYorkEvictionsCoordsSub@coords[,1],
+                          y=NewYorkEvictionsCoordsSub@coords[,2],
+                          window=window)
+```
+
+```{r}
+NewYorkEvictionsCoordsSub.ppp %>%
+  plot(.,pch=16,cex=0.5, 
+       main="Blue Plaques Ward311")
+```
+# Point pattern analysis
+```{r}
+NewYorkEvictionsCoordsSub.ppp %>%
+  density(., sigma=500) %>%
+  plot()
+```
+
+```{r}
+K <- NewYorkEvictionsCoordsSub.ppp %>%
+  Kest(., correction="border") %>%
+  plot()
+```
+ The value of K falls above the line, the New York evictions show the clustered in this ward. 
+
+# 3.基于密度的噪声应用空间聚类：DBSCAN
+
+
+```{r}
+library(raster)
+library(fpc)
+```
+
+```{r}
+st_geometry(NewYorkward) %>% 
+  st_transform(., 27700)
+```
+
+```{r}
+#first extract the points from the spatial points data frame
+NewYorkEvictionsCoordsSubPoints <- NewYorkEvictionsCoordsSub %>%
+  coordinates(.)%>%
+  as.data.frame()
+
+#now run the dbscan analysis
+db <- NewYorkEvictionsCoordsSubPoints %>%
+  fpc::dbscan(.,eps = 700, MinPts = 8)
+
+#now plot the results
+plot(db, NewYorkEvictionsCoordsSubPoints, main = "DBSCAN Output", frame = F)
+plot(NewYorkward$geometry, add=T)
+```
+
